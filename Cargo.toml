@@ -1,0 +1,18 @@
+[package]
+name = "zellij-tab-sidebar"
+version = "0.1.0"
+edition = "2021"
+description = "A vertical tab sidebar for zellij: each tab shows a title + description line, with separators, active highlighting, and click/scroll to switch."
+license = "MIT"
+repository = "https://github.com/yusukeshib/zellij-tab-sidebar"
+readme = "README.md"
+
+[dependencies]
+# Pin to the tag matching the zellij binary for ABI compatibility.
+zellij-tile = { git = "https://github.com/zellij-org/zellij", tag = "v0.44.3" }
+unicode-width = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
