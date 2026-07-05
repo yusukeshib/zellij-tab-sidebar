@@ -44,6 +44,12 @@ function summarize(prompt: string, cb: (summary: string) => void): void {
     "pi",
     [
       "-p",
+      // Cheap + fast for a few-word summary. Provider must be explicit: the
+      // CLI's default provider is google, so a bare "haiku" pattern misresolves.
+      // If this model isn't available, summarize just yields nothing and the
+      // raw-prompt fallback stays in place.
+      "--model",
+      "anthropic/claude-haiku-4-5",
       "--no-extensions",
       "--no-skills",
       "--no-tools",
