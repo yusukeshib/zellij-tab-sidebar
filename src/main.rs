@@ -200,13 +200,19 @@ fn parse_status(s: &str) -> (String, StatusColor) {
 // so the file is scoped by session name (pane ids restart per session).
 // Keyed by pane id: stable across tab reorder/close, and identical across
 // instances (they all receive the same PaneManifest).
-fn state_path(session: &str) -> String {
-    format!("/cache/pipe-state-{}.tsv", session)
+//
+// Two kinds share the same on-disk format under different files:
+//   "pipe" — explicit `zellij pipe` overrides (highest precedence)
+//   "cmd"  — per-field command output. Shared too (not just per-instance) so
+//            every tab's sidebar renders the SAME description for a tab,
+//            instead of each instance computing its own and disagreeing.
+fn state_path(session: &str, kind: &str) -> String {
+    format!("/cache/{}-state-{}.tsv", kind, session)
 }
 
-fn read_pipe_state(session: &str) -> HashMap<(Field, u32), String> {
+fn read_state(session: &str, kind: &str) -> HashMap<(Field, u32), String> {
     let mut map = HashMap::new();
-    let Ok(content) = std::fs::read_to_string(state_path(session)) else {
+    let Ok(content) = std::fs::read_to_string(state_path(session, kind)) else {
         return map;
     };
     for line in content.lines() {
@@ -226,7 +232,7 @@ fn read_pipe_state(session: &str) -> HashMap<(Field, u32), String> {
     map
 }
 
-fn write_pipe_state(session: &str, map: &HashMap<(Field, u32), String>) {
+fn write_state(session: &str, kind: &str, map: &HashMap<(Field, u32), String>) {
     let mut s = String::new();
     for ((field, pid), val) in map {
         // Values are single-line records; strip separators defensively.
@@ -238,7 +244,7 @@ fn write_pipe_state(session: &str, map: &HashMap<(Field, u32), String>) {
         s.push_str(&val);
         s.push('\n');
     }
-    let _ = std::fs::write(state_path(session), s);
+    let _ = std::fs::write(state_path(session, kind), s);
 }
 
 // ---- State -------------------------------------------------------------------
@@ -264,8 +270,13 @@ struct State {
     // Overrides set via `zellij pipe` (highest precedence), keyed by pane id and
     // persisted to `/cache` so all sidebar instances (one per tab) stay in sync.
     pipe_vals: HashMap<(Field, u32), String>,
-    // Values produced by the per-field commands, keyed by tab position.
-    auto_vals: HashMap<(Field, usize), String>,
+    // Values produced by the per-field commands. Keyed by pane id (like
+    // `pipe_vals`) and persisted to the shared `/cache` file so every tab's
+    // sidebar instance renders the same command output for a given tab.
+    cmd_vals: HashMap<(Field, u32), String>,
+    // This instance's own plugin pane id (from `get_plugin_ids`), used to find
+    // which tab it lives in so it only runs commands for that tab.
+    plugin_id: u32,
 
     // Live per-pane working directory (cwd for the field commands).
     cwd: HashMap<u32, PathBuf>, // key: terminal pane id
@@ -278,6 +289,8 @@ register_plugin!(State);
 
 impl ZellijPlugin for State {
     fn load(&mut self, config: BTreeMap<String, String>) {
+        // Remember our own plugin pane id so we can find which tab we live in.
+        self.plugin_id = get_plugin_ids().plugin_id;
         for f in FIELDS {
             if let Some(cmd) = config.get(f.config_key()) {
                 let cmd = cmd.trim();
@@ -327,7 +340,7 @@ impl ZellijPlugin for State {
                 if self.session != mode_info.session_name {
                     self.session = mode_info.session_name.clone();
                     // First chance to load overrides published by siblings.
-                    should_render = self.reload_pipe_state() || should_render;
+                    should_render = self.reload_shared() || should_render;
                 }
             }
             Event::TabUpdate(tabs) => {
@@ -346,7 +359,7 @@ impl ZellijPlugin for State {
             Event::Timer(_) => {
                 self.timer_running = false;
                 // Pick up overrides written by other tabs' sidebar instances.
-                should_render = self.reload_pipe_state();
+                should_render = self.reload_shared();
                 // The timer ticks fast (cross-instance sync must be snappy);
                 // the field commands only run every `interval` seconds.
                 self.ticks_left = self.ticks_left.saturating_sub(1);
@@ -361,6 +374,13 @@ impl ZellijPlugin for State {
             }
             Event::PaneUpdate(pm) => {
                 self.panes = pm;
+                // Pane ids are recycled within a session: once a pane closes,
+                // its id can be handed to a brand-new pane in another tab. If a
+                // stale override lingered for the dead id, that unrelated tab
+                // would suddenly render the old description. Drop overrides for
+                // panes that no longer exist so descriptions stay attached to
+                // the right tab.
+                self.prune_dead_panes();
                 should_render = true;
             }
             Event::CwdChanged(PaneId::Terminal(id), new_cwd, _) => {
@@ -424,13 +444,13 @@ impl ZellijPlugin for State {
         // Read-modify-write the shared file so concurrent writes from sibling
         // instances don't clobber each other.
         let session = self.session.clone().unwrap_or_default();
-        let mut vals = read_pipe_state(&session);
+        let mut vals = read_state(&session, "pipe");
         if text.trim().is_empty() {
             vals.remove(&(field, pid));
         } else {
             vals.insert((field, pid), text.trim().to_string());
         }
-        write_pipe_state(&session, &vals);
+        write_state(&session, "pipe", &vals);
         self.pipe_vals = vals;
         true
     }
@@ -500,7 +520,24 @@ impl State {
         if self.commands.is_empty() {
             return;
         }
+        // Each tab has its own sidebar instance; only run commands for the tab
+        // this instance lives in (results are shared via `/cache`, so every
+        // instance renders the same value). This avoids N² command runs and,
+        // more importantly, the disagreement that made a tab's description look
+        // different depending on which tab you viewed it from. If we can't yet
+        // tell which tab we're in (manifest not ready), fall back to all tabs.
+        let own = self.own_tab();
         for tab in &self.tabs {
+            if let Some(pos) = own {
+                if tab.position != pos {
+                    continue;
+                }
+            }
+            // The pane a result is attributed to — same resolution `pipe_val`
+            // uses to read it back (focused non-plugin, else first non-plugin).
+            let Some(target) = self.target_pane_id(tab.position) else {
+                continue;
+            };
             let focused = self.focused_pane(tab.position);
             let cwd = focused
                 .and_then(|p| self.cwd.get(&p.id).cloned())
@@ -527,7 +564,7 @@ impl State {
             for (field, cmd) in &self.commands {
                 let mut ctx = BTreeMap::new();
                 ctx.insert("kind".to_string(), field.key().to_string());
-                ctx.insert("tab".to_string(), tab.position.to_string());
+                ctx.insert("pane".to_string(), target.to_string());
                 run_command_with_env_variables_and_cwd(
                     &["sh", "-c", cmd],
                     env.clone(),
@@ -563,7 +600,7 @@ impl State {
                 let Some(field) = FIELDS.iter().copied().find(|f| f.key() == kind) else {
                     return false;
                 };
-                let Some(pos) = ctx.get("tab").and_then(|s| s.parse::<usize>().ok()) else {
+                let Some(pid) = ctx.get("pane").and_then(|s| s.parse::<u32>().ok()) else {
                     return false;
                 };
                 // Description keeps its full output (it may wrap to two lines);
@@ -573,14 +610,23 @@ impl State {
                 } else {
                     out.lines().next().unwrap_or("").trim().to_string()
                 };
-                let key = (field, pos);
+                let key = (field, pid);
+                // Read-modify-write the shared file so concurrent writes from
+                // sibling instances (each owning a different tab) don't clobber
+                // each other, then adopt the merged result.
+                let session = self.session.clone().unwrap_or_default();
+                let mut vals = read_state(&session, "cmd");
                 if exit_code == Some(0) && !value.is_empty() {
-                    let changed = self.auto_vals.get(&key) != Some(&value);
-                    self.auto_vals.insert(key, value);
-                    changed
+                    vals.insert(key, value);
                 } else {
-                    self.auto_vals.remove(&key).is_some()
+                    vals.remove(&key);
                 }
+                let changed = vals != self.cmd_vals;
+                if changed {
+                    write_state(&session, "cmd", &vals);
+                    self.cmd_vals = vals;
+                }
+                changed
             }
             _ => false,
         }
@@ -592,32 +638,88 @@ impl State {
     /// A pipe override for this tab: the value stored for the tab's focused
     /// pane, else any non-plugin pane in the tab. Works for inactive tabs too
     /// (the PaneManifest lists every tab's panes).
-    fn pipe_val(&self, field: Field, tab: &TabInfo) -> Option<&String> {
+    /// Look up a tab's value in a pane-keyed store: the tab's focused pane
+    /// first, else any non-plugin pane in the tab. Works for inactive tabs too
+    /// (the PaneManifest lists every tab's panes).
+    fn store_val<'a>(
+        &self,
+        store: &'a HashMap<(Field, u32), String>,
+        field: Field,
+        tab: &TabInfo,
+    ) -> Option<&'a String> {
         let panes = self.panes.panes.get(&tab.position)?;
         if let Some(p) = panes.iter().find(|p| p.is_focused && !p.is_plugin) {
-            if let Some(v) = self.pipe_vals.get(&(field, p.id)) {
+            if let Some(v) = store.get(&(field, p.id)) {
                 return Some(v);
             }
         }
         panes
             .iter()
             .filter(|p| !p.is_plugin)
-            .find_map(|p| self.pipe_vals.get(&(field, p.id)))
+            .find_map(|p| store.get(&(field, p.id)))
+    }
+
+    fn pipe_val(&self, field: Field, tab: &TabInfo) -> Option<&String> {
+        self.store_val(&self.pipe_vals, field, tab)
     }
 
     fn field_val(&self, field: Field, tab: &TabInfo) -> Option<&String> {
         self.pipe_val(field, tab)
-            .or_else(|| self.auto_vals.get(&(field, tab.position)))
+            .or_else(|| self.store_val(&self.cmd_vals, field, tab))
     }
 
-    /// Reload the shared override file; returns whether anything changed.
-    fn reload_pipe_state(&mut self) -> bool {
-        let vals = read_pipe_state(self.session.as_deref().unwrap_or_default());
-        if vals != self.pipe_vals {
-            self.pipe_vals = vals;
-            true
-        } else {
-            false
+    /// The tab position this plugin instance lives in (its plugin pane), so it
+    /// only runs field commands for its own tab. `None` until the manifest
+    /// listing our plugin pane arrives.
+    fn own_tab(&self) -> Option<usize> {
+        self.panes.panes.iter().find_map(|(pos, panes)| {
+            panes
+                .iter()
+                .any(|p| p.is_plugin && p.id == self.plugin_id)
+                .then_some(*pos)
+        })
+    }
+
+    /// Reload both shared override files; returns whether anything changed.
+    fn reload_shared(&mut self) -> bool {
+        let session = self.session.as_deref().unwrap_or_default();
+        let mut changed = false;
+        let pipe = read_state(session, "pipe");
+        if pipe != self.pipe_vals {
+            self.pipe_vals = pipe;
+            changed = true;
+        }
+        let cmd = read_state(session, "cmd");
+        if cmd != self.cmd_vals {
+            self.cmd_vals = cmd;
+            changed = true;
+        }
+        changed
+    }
+
+    /// Drop overrides for panes that no longer exist. Pane ids are recycled
+    /// within a session, so a lingering entry for a closed pane would otherwise
+    /// resurface on whatever new pane inherits its id — in an unrelated tab.
+    fn prune_dead_panes(&mut self) {
+        if self.panes.panes.is_empty() {
+            return; // no manifest yet; don't wipe everything
+        }
+        let live: std::collections::HashSet<u32> = self
+            .panes
+            .panes
+            .values()
+            .flatten()
+            .filter(|p| !p.is_plugin)
+            .map(|p| p.id)
+            .collect();
+        let session = self.session.clone().unwrap_or_default();
+        for (kind, map) in [("pipe", true), ("cmd", false)] {
+            let store = if map { &mut self.pipe_vals } else { &mut self.cmd_vals };
+            let before = store.len();
+            store.retain(|(_, pid), _| live.contains(pid));
+            if store.len() != before {
+                write_state(&session, kind, store);
+            }
         }
     }
 
