@@ -3,8 +3,8 @@
  *
  * Mirrors the agent's state into the sidebar:
  *   description: a short LLM summary of the FIRST prompt of the session
- *                (set once; raw prompt shown instantly, summary swapped in when
- *                ready; falls back to the raw prompt if summarization fails)
+ *                (set once, only when the summary is ready; left unset if
+ *                summarization fails)
  *   status:      running (while the agent works) | idle (waiting for input)
  *
  * Install: copy or symlink into ~/.pi/agent/extensions/
@@ -87,8 +87,9 @@ export default function (pi: ExtensionAPI) {
       const raw = (event.prompt ?? "").replace(/\s+/g, " ").trim();
       if (raw) {
         descSet = true;
-        pipe("tab_desc", raw.slice(0, 48)); // instant fallback
-        summarize(raw, (summary) => pipe("tab_desc", summary)); // swap in when ready
+        // Set the description only once the LLM summary is ready (no raw-prompt
+        // preview). If summarization fails, the description is simply left unset.
+        summarize(raw, (summary) => pipe("tab_desc", summary));
       }
     }
     pipe("tab_status", "running");
