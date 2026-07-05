@@ -187,6 +187,55 @@ fn parse_status(s: &str) -> (String, StatusColor) {
     (s.to_string(), StatusColor::from_keyword(s))
 }
 
+// ---- Cross-instance persistence ---------------------------------------------
+// `default_layout` injects the sidebar into every tab, so there is one plugin
+// instance PER TAB, each with its own memory. A `zellij pipe` override only
+// reaches the instances alive at pipe time, so instances created later (e.g.
+// when you open a new tab) never saw past overrides and render those tabs blank.
+//
+// Fix: persist overrides to `/data` — a plugin-owned folder shared by all
+// loaded instances of this plugin — and reload it on load and on the timer.
+// Keyed by pane id: stable across tab reorder/close, and identical across
+// instances (they all receive the same PaneManifest).
+const STATE_PATH: &str = "/data/pipe-state.tsv";
+
+fn read_pipe_state() -> HashMap<(Field, u32), String> {
+    let mut map = HashMap::new();
+    let Ok(content) = std::fs::read_to_string(STATE_PATH) else {
+        return map;
+    };
+    for line in content.lines() {
+        // Format: <pane_id>\t<field_key>\t<value>
+        let mut it = line.splitn(3, '\t');
+        let (Some(pid), Some(key), Some(val)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let (Ok(pid), Some(field)) = (
+            pid.parse::<u32>(),
+            FIELDS.iter().copied().find(|f| f.key() == key),
+        ) else {
+            continue;
+        };
+        map.insert((field, pid), val.to_string());
+    }
+    map
+}
+
+fn write_pipe_state(map: &HashMap<(Field, u32), String>) {
+    let mut s = String::new();
+    for ((field, pid), val) in map {
+        // Values are single-line records; strip separators defensively.
+        let val = val.replace(['\n', '\r', '\t'], " ");
+        s.push_str(&pid.to_string());
+        s.push('\t');
+        s.push_str(field.key());
+        s.push('\t');
+        s.push_str(&val);
+        s.push('\n');
+    }
+    let _ = std::fs::write(STATE_PATH, s);
+}
+
 // ---- State -------------------------------------------------------------------
 #[derive(Default)]
 struct State {
@@ -201,9 +250,10 @@ struct State {
     started: bool,       // engine kicked off
     timer_running: bool, // refresh timer scheduled
 
-    // Values set via `zellij pipe` (highest precedence), keyed by tab position.
-    pipe_vals: HashMap<(Field, usize), String>,
-    // Values produced by the per-field commands.
+    // Overrides set via `zellij pipe` (highest precedence), keyed by pane id and
+    // persisted to `/data` so all sidebar instances (one per tab) stay in sync.
+    pipe_vals: HashMap<(Field, u32), String>,
+    // Values produced by the per-field commands, keyed by tab position.
     auto_vals: HashMap<(Field, usize), String>,
 
     // Live per-pane working directory (cwd for the field commands).
@@ -230,6 +280,8 @@ impl ZellijPlugin for State {
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(2.0)
             .max(0.5);
+        // Load overrides already published by sibling instances.
+        self.pipe_vals = read_pipe_state();
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
@@ -276,6 +328,8 @@ impl ZellijPlugin for State {
             }
             Event::Timer(_) => {
                 self.timer_running = false;
+                // Pick up overrides written by other tabs' sidebar instances.
+                should_render = self.reload_pipe_state();
                 self.spawn_commands();
                 self.schedule_timer();
             }
@@ -325,25 +379,36 @@ impl ZellijPlugin for State {
         };
         let text = msg.payload.unwrap_or_default();
 
-        // Resolve the target tab position (0-based).
-        let pos: Option<usize> =
+        // Resolve the target pane id: explicit `pane_id`, else the focused (or
+        // first) pane of the target tab (`tab=N`, or the active tab).
+        let pane_id: Option<u32> =
             if let Some(pid) = msg.args.get("pane_id").and_then(|s| s.parse::<u32>().ok()) {
-                self.tab_position_of_pane(pid)
-            } else if let Some(t) = msg.args.get("tab").and_then(|s| s.parse::<usize>().ok()) {
-                (t >= 1).then(|| t - 1)
+                Some(pid)
             } else {
-                self.active_idx.checked_sub(1)
+                let pos = if let Some(t) = msg.args.get("tab").and_then(|s| s.parse::<usize>().ok())
+                {
+                    t.checked_sub(1)
+                } else {
+                    self.active_idx.checked_sub(1)
+                };
+                pos.and_then(|p| self.target_pane_id(p))
             };
 
-        if let Some(pos) = pos {
-            if text.trim().is_empty() {
-                self.pipe_vals.remove(&(field, pos));
-            } else {
-                self.pipe_vals.insert((field, pos), text.trim().to_string());
-            }
-            return true;
+        let Some(pid) = pane_id else {
+            return false;
+        };
+
+        // Read-modify-write the shared file so concurrent writes from sibling
+        // instances don't clobber each other.
+        let mut vals = read_pipe_state();
+        if text.trim().is_empty() {
+            vals.remove(&(field, pid));
+        } else {
+            vals.insert((field, pid), text.trim().to_string());
         }
-        false
+        write_pipe_state(&vals);
+        self.pipe_vals = vals;
+        true
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
@@ -396,8 +461,10 @@ impl State {
         self.schedule_timer();
     }
 
+    // Always runs (even with no field commands) so every instance periodically
+    // reloads the shared override file and converges with its siblings.
     fn schedule_timer(&mut self) {
-        if !self.timer_running && !self.commands.is_empty() {
+        if !self.timer_running {
             self.timer_running = true;
             set_timeout(self.interval);
         }
@@ -490,15 +557,51 @@ impl State {
 
 // ---- Field values --------------------------------------------------------------
 impl State {
-    fn field_val(&self, field: Field, pos: usize) -> Option<&String> {
-        self.pipe_vals
-            .get(&(field, pos))
-            .or_else(|| self.auto_vals.get(&(field, pos)))
+    /// A pipe override for this tab: the value stored for the tab's focused
+    /// pane, else any non-plugin pane in the tab. Works for inactive tabs too
+    /// (the PaneManifest lists every tab's panes).
+    fn pipe_val(&self, field: Field, tab: &TabInfo) -> Option<&String> {
+        let panes = self.panes.panes.get(&tab.position)?;
+        if let Some(p) = panes.iter().find(|p| p.is_focused && !p.is_plugin) {
+            if let Some(v) = self.pipe_vals.get(&(field, p.id)) {
+                return Some(v);
+            }
+        }
+        panes
+            .iter()
+            .filter(|p| !p.is_plugin)
+            .find_map(|p| self.pipe_vals.get(&(field, p.id)))
+    }
+
+    fn field_val(&self, field: Field, tab: &TabInfo) -> Option<&String> {
+        self.pipe_val(field, tab)
+            .or_else(|| self.auto_vals.get(&(field, tab.position)))
+    }
+
+    /// Reload the shared override file; returns whether anything changed.
+    fn reload_pipe_state(&mut self) -> bool {
+        let vals = read_pipe_state();
+        if vals != self.pipe_vals {
+            self.pipe_vals = vals;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The pane a `tab=N` / active-tab pipe targets: focused, else first.
+    fn target_pane_id(&self, pos: usize) -> Option<u32> {
+        let panes = self.panes.panes.get(&pos)?;
+        panes
+            .iter()
+            .find(|p| p.is_focused && !p.is_plugin)
+            .or_else(|| panes.iter().find(|p| !p.is_plugin))
+            .map(|p| p.id)
     }
 
     /// Title: pipe -> command -> zellij tab name.
     fn tab_title(&self, tab: &TabInfo) -> String {
-        if let Some(t) = self.field_val(Field::Title, tab.position) {
+        if let Some(t) = self.field_val(Field::Title, tab) {
             return t.clone();
         }
         if tab.name.is_empty() {
@@ -510,14 +613,14 @@ impl State {
 
     /// Description: pipe -> command -> empty (hidden).
     fn tab_description(&self, tab: &TabInfo) -> String {
-        self.field_val(Field::Description, tab.position)
+        self.field_val(Field::Description, tab)
             .cloned()
             .unwrap_or_default()
     }
 
     /// Status: pipe -> command -> derived running|idle|error.
     fn tab_status(&self, tab: &TabInfo) -> (String, StatusColor) {
-        if let Some(s) = self.field_val(Field::Status, tab.position) {
+        if let Some(s) = self.field_val(Field::Status, tab) {
             return parse_status(s);
         }
         self.default_status(tab)
@@ -552,15 +655,6 @@ impl State {
             .find(|p| p.is_focused && !p.is_plugin)
     }
 
-    /// Which tab (position) contains the given terminal pane?
-    fn tab_position_of_pane(&self, pane_id: u32) -> Option<usize> {
-        self.panes.panes.iter().find_map(|(pos, panes)| {
-            panes
-                .iter()
-                .any(|p| !p.is_plugin && p.id == pane_id)
-                .then_some(*pos)
-        })
-    }
 }
 
 // ---- Rendering ------------------------------------------------------------------
