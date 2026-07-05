@@ -1,12 +1,16 @@
 #!/bin/sh
 # zellij-tab-sidebar description_command: summarize the focused pane's visible
 # buffer (provided by the plugin in $ZELLIJ_SIDEBAR_PANE_CONTENT) into a short
-# one-liner via a cheap one-shot `pi -p` call.
+# one-liner via a local Ollama model — free, offline, no API cost.
+#
+# Requires: `ollama serve` running and the model pulled
+# (`ollama pull qwen2.5:7b`). Override with $ZELLIJ_SIDEBAR_OLLAMA_MODEL
+# (qwen2.5:3b is faster but noticeably less accurate for this task).
 #
 # Usage (layout):
 #   plugin location="..." {
 #       description_command "/path/to/summarize-pane.sh"
-#       interval "30"    # LLM call per tab per interval — keep this high!
+#       interval "120"   # summarize per tab per interval
 #   }
 #
 # Caches per tab: only re-summarizes when the pane content changed.
@@ -27,13 +31,27 @@ if [ -f "$CACHE" ]; then
     fi
 fi
 
-SUMMARY=$(printf '%s' "$ZELLIJ_SIDEBAR_PANE_CONTENT" | pi -p \
-    --model anthropic/claude-haiku-4-5 \
-    --no-extensions --no-skills --no-tools --no-session \
-    "Summarize what is currently happening in this terminal, in Japanese, in
-about 10 to 20 characters. Output only the summary, no punctuation, no
-quotes, no explanations. If you cannot tell, output exactly: 不明.
-Terminal content follows:" 2>/dev/null | tr -s ' \n' ' ' | sed 's/^ //;s/ $//')
+MODEL="${ZELLIJ_SIDEBAR_OLLAMA_MODEL:-qwen2.5:7b}"
+HOST="${OLLAMA_HOST:-http://localhost:11434}"
+
+# A concrete few-shot prompt keeps small models from echoing the input or
+# emitting full sentences — they output a short Japanese noun phrase instead.
+PROMPT="あなたはターミナル画面を見て、ユーザーが今何をしているかを推測するアシスタントです。
+以下のターミナル内容から、作業内容を日本語の短い名詞句（10〜18文字）で1つだけ出力してください。文や句読点や引用符や説明は禁止。名詞句のみ。
+例:
+- cargoのビルド出力 → Rustのビルド
+- git log → コミット履歴の確認
+- npm test → テスト実行中
+
+ターミナル内容:
+$ZELLIJ_SIDEBAR_PANE_CONTENT"
+
+# Build the JSON request body safely (jq escapes the prompt).
+REQ=$(jq -nc --arg m "$MODEL" --arg p "$PROMPT" \
+    '{model:$m, prompt:$p, stream:false, options:{num_predict:24, temperature:0.2}}')
+
+SUMMARY=$(printf '%s' "$REQ" | curl -s --max-time 30 "$HOST/api/generate" -d @- 2>/dev/null \
+    | jq -r '.response // empty' | tr -s ' \n' ' ' | sed 's/^ //;s/ $//')
 
 # Guard: refusals/explanations are long; 不明 is the explicit sentinel.
 case "$SUMMARY" in
