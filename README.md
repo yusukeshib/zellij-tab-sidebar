@@ -19,15 +19,17 @@ commands (pull, starship-style).
 
 | Field | Default | Override | Rendering |
 |---|---|---|---|
-| **title** | zellij tab name | `ZELLIJ_SIDEBAR_TITLE_COMMAND` / pipe `tab_title` | bold, one line |
+| **title** | zellij tab name | `ZELLIJ_SIDEBAR_TITLE_COMMAND` / pipe `tab_title` | bold, one line, dimmed index |
 | **status** | `running` \| `idle` \| `error` (derived from command panes) | `ZELLIJ_SIDEBAR_STATUS_COMMAND` / pipe `tab_status` | `● text`, colored |
 | **description** | empty (hidden) | `ZELLIJ_SIDEBAR_DESCRIPTION_COMMAND` / pipe `tab_desc` | dim, word-wrapped, max 2 lines |
 
 Precedence per field: **pipe (manual) → command (auto) → default**.
 
-Plus: theme-aware colors, accent bar + highlight on the active tab, click to
-switch, scroll to move between tabs, overflow scrolling that follows the
-active tab.
+The leading number is the tab index (jump with `Ctrl t` then the digit).
+
+Plus: theme-aware colors, a darkened highlight + accent bar `▎` on the active
+tab, click to switch, scroll to move between tabs, and overflow scrolling that
+follows the active tab.
 
 ## Requirements
 
@@ -73,11 +75,12 @@ layout {
         }
         pane borderless=true focus=true
     }
-    pane size=1 borderless=true {
-        plugin location="zellij:compact-bar"
-    }
 }
 ```
+
+The sidebar replaces the built-in tab bar, so the layout needs no
+`tab-bar`/`compact-bar` pane. Add one back if you still want the mode
+indicator at the bottom.
 
 Launch a session with it:
 
@@ -85,7 +88,9 @@ Launch a session with it:
 zellij --new-session-with-layout vertical-sidebar
 ```
 
-To always use it, set `default_layout "vertical-sidebar"` in your zellij config.
+To always use it, set `default_layout "vertical-sidebar"` in your zellij
+config — then a plain `zellij` starts with the sidebar (applies to new
+sessions only, not `attach`).
 
 ## Updating fields via `zellij pipe` (push)
 
