@@ -2,9 +2,10 @@
  * zellij-tab-sidebar integration for pi (https://github.com/badlogic/pi-mono).
  *
  * Mirrors the agent's state into the sidebar:
- *   description: a short LLM summary of the FIRST prompt of the session
- *                (set once, only when the summary is ready; left unset if
- *                summarization fails)
+ *   description: a short LLM summary of what the session is currently working
+ *                on, refreshed on every new prompt from the recent prompt
+ *                history (follows the conversation). Left unset if the summary
+ *                fails; overlapping refreshes are coalesced.
  *   status:      running (while the agent works) | idle (waiting for input)
  *
  * Install: copy or symlink into ~/.pi/agent/extensions/
@@ -28,69 +29,89 @@ function pipe(name: string, payload: string): void {
   );
 }
 
-// Summarize the prompt into a few words via a one-shot, ephemeral `pi -p` call.
-// Async + fire-and-forget: never blocks the agent, and any failure/timeout just
-// leaves the raw-prompt fallback in place. `--no-extensions` avoids re-loading
-// this extension (no recursion).
+// Summarize the recent prompt history into a few words via a one-shot, ephemeral
+// `pi -p` call. Async + fire-and-forget: never blocks the agent. `cb` is always
+// invoked exactly once (with "" on failure/timeout) so callers can clear their
+// in-flight guard. `--no-extensions` avoids re-loading this extension.
 //
 // NOTE: must use spawn + stdin.end(), NOT execFile. `pi -p` reads stdin, so an
 // open stdin pipe (execFile's default) makes it hang until timeout. Closing
 // stdin sends EOF so it returns in ~2s.
-function summarize(prompt: string, cb: (summary: string) => void): void {
+function summarize(text: string, cb: (summary: string) => void): void {
   const instruction =
-    "Summarize this coding task in 3 to 5 words. Output only the summary, " +
-    "lowercase, no punctuation, no quotes. Task: ";
+    "Summarize what this coding session is currently working on in 3 to 5 " +
+    "words. Output only the summary, lowercase, no punctuation, no quotes. " +
+    "Base it on the user's requests below (later ones are more recent):\n\n";
   const child = spawn(
     "pi",
     [
       "-p",
       // Cheap + fast for a few-word summary. Provider must be explicit: the
       // CLI's default provider is google, so a bare "haiku" pattern misresolves.
-      // If this model isn't available, summarize just yields nothing and the
-      // raw-prompt fallback stays in place.
       "--model",
       "anthropic/claude-haiku-4-5",
       "--no-extensions",
       "--no-skills",
       "--no-tools",
       "--no-session",
-      instruction + prompt,
+      instruction + text,
     ],
     { timeout: 30_000 },
   );
   let out = "";
+  let done = false;
+  const finish = (s: string) => {
+    if (!done) {
+      done = true;
+      cb(s);
+    }
+  };
   child.stdout?.on("data", (d) => {
     if (out.length < 4096) out += d;
   });
-  child.on("error", () => {}); // e.g. pi not on PATH -> keep the fallback
-  child.on("close", () => {
-    const s = out.replace(/\s+/g, " ").trim().slice(0, 60);
-    if (s) cb(s);
-  });
+  child.on("error", () => finish("")); // e.g. pi not on PATH
+  child.on("close", () => finish(out.replace(/\s+/g, " ").trim().slice(0, 60)));
   child.stdin?.end(); // send EOF so `pi -p` doesn't wait on stdin
 }
 
 export default function (pi: ExtensionAPI) {
   if (!IN_ZELLIJ) return;
 
-  // Description is set once per session (the first prompt = the session's task).
-  let descSet = false;
+  // Recent user prompts drive the description; re-summarized as the session goes.
+  let prompts: string[] = [];
+  let inFlight = false; // a summarize child is running
+  let dirty = false; // a newer prompt arrived while summarizing
 
-  // Fresh session -> allow the description to be set again from its first prompt.
+  const refresh = (): void => {
+    if (inFlight || prompts.length === 0) {
+      if (inFlight) dirty = true;
+      return;
+    }
+    inFlight = true;
+    // Last few prompts, most-recent-last, bounded so the input stays small.
+    const text = prompts.slice(-8).join("\n").slice(-2000);
+    summarize(text, (summary) => {
+      if (summary) pipe("tab_desc", summary);
+      inFlight = false;
+      if (dirty) {
+        dirty = false;
+        refresh(); // coalesce: summarize once more for the prompts we skipped
+      }
+    });
+  };
+
+  // Fresh session -> reset the prompt history.
   pi.on("session_start", async () => {
-    descSet = false;
+    prompts = [];
+    inFlight = false;
+    dirty = false;
   });
 
   pi.on("before_agent_start", async (event) => {
-    // Only the first prompt of the session becomes the description.
-    if (!descSet) {
-      const raw = (event.prompt ?? "").replace(/\s+/g, " ").trim();
-      if (raw) {
-        descSet = true;
-        // Set the description only once the LLM summary is ready (no raw-prompt
-        // preview). If summarization fails, the description is simply left unset.
-        summarize(raw, (summary) => pipe("tab_desc", summary));
-      }
+    const raw = (event.prompt ?? "").replace(/\s+/g, " ").trim();
+    if (raw) {
+      prompts.push(raw);
+      refresh(); // update the description to follow the conversation
     }
     pipe("tab_status", "running");
   });
