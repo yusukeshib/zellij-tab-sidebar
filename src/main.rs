@@ -1,58 +1,248 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::*;
 
-// ---- ANSI colors ------------------------------------------------------------
+// ---- ANSI helpers -----------------------------------------------------------
 const RESET: &str = "\x1b[0m";
-const ACTIVE_BG: &str = "\x1b[48;5;238m"; // selected tab block background (dark gray)
-const FG_NORMAL: &str = "\x1b[38;5;252m"; // normal text on the panel
-const DIM: &str = "\x1b[38;5;244m"; // descriptions (gray)
 const BOLD: &str = "\x1b[1m";
+const DIM: &str = "\x1b[2m";
+const FIELD_SEP: char = '\u{1f}'; // unit separator, used by the env probe
 
-// Row markers
-const TAB_ACTIVE: &str = "●";
-const TAB_INACTIVE: &str = "o";
-const PANE_FOCUSED: &str = "▸";
-const PANE_UNFOCUSED: &str = "·";
-
-/// What clicking a rendered row should do.
-#[derive(Clone, Copy)]
-enum Action {
-    SwitchTab(u32), // 1-based tab index
-    FocusPane(u32), // terminal pane id
+fn fg(c: PaletteColor) -> String {
+    match c {
+        PaletteColor::Rgb((r, g, b)) => format!("\x1b[38;2;{};{};{}m", r, g, b),
+        PaletteColor::EightBit(n) => format!("\x1b[38;5;{}m", n),
+    }
 }
 
+fn bg(c: PaletteColor) -> String {
+    match c {
+        PaletteColor::Rgb((r, g, b)) => format!("\x1b[48;2;{};{};{}m", r, g, b),
+        PaletteColor::EightBit(n) => format!("\x1b[48;5;{}m", n),
+    }
+}
+
+/// Approximate an xterm 256-color index as RGB.
+fn eightbit_to_rgb(n: u8) -> (u8, u8, u8) {
+    match n {
+        // Standard + bright 16 colors.
+        0 => (0, 0, 0),
+        1 => (128, 0, 0),
+        2 => (0, 128, 0),
+        3 => (128, 128, 0),
+        4 => (0, 0, 128),
+        5 => (128, 0, 128),
+        6 => (0, 128, 128),
+        7 => (192, 192, 192),
+        8 => (128, 128, 128),
+        9 => (255, 0, 0),
+        10 => (0, 255, 0),
+        11 => (255, 255, 0),
+        12 => (0, 0, 255),
+        13 => (255, 0, 255),
+        14 => (0, 255, 255),
+        15 => (255, 255, 255),
+        // 6x6x6 color cube.
+        16..=231 => {
+            let i = n - 16;
+            let step = |c: u8| if c == 0 { 0 } else { 55 + 40 * c };
+            (step(i / 36), step((i / 6) % 6), step(i % 6))
+        }
+        // Grayscale ramp.
+        232..=255 => {
+            let v = 8 + (n - 232) * 10;
+            (v, v, v)
+        }
+    }
+}
+
+/// Darken a color toward black by `factor` (0.0 = black, 1.0 = unchanged).
+fn darken(c: PaletteColor, factor: f32) -> PaletteColor {
+    let (r, g, b) = match c {
+        PaletteColor::Rgb(rgb) => rgb,
+        PaletteColor::EightBit(n) => eightbit_to_rgb(n),
+    };
+    let f = factor.clamp(0.0, 1.0);
+    let s = |v: u8| (v as f32 * f).round() as u8;
+    PaletteColor::Rgb((s(r), s(g), s(b)))
+}
+
+// ---- Fields ------------------------------------------------------------------
+/// The three per-tab fields shown in the sidebar. Each one can be overridden
+/// by a pipe message or produced by a command (config / env var).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Field {
+    Title,
+    Description,
+    Status,
+}
+
+const FIELDS: [Field; 3] = [Field::Title, Field::Description, Field::Status];
+
+impl Field {
+    fn key(self) -> &'static str {
+        match self {
+            Field::Title => "title",
+            Field::Description => "description",
+            Field::Status => "status",
+        }
+    }
+
+    fn config_key(self) -> &'static str {
+        match self {
+            Field::Title => "title_command",
+            Field::Description => "description_command",
+            Field::Status => "status_command",
+        }
+    }
+
+    fn env_var(self) -> &'static str {
+        match self {
+            Field::Title => "ZELLIJ_SIDEBAR_TITLE_COMMAND",
+            Field::Description => "ZELLIJ_SIDEBAR_DESCRIPTION_COMMAND",
+            Field::Status => "ZELLIJ_SIDEBAR_STATUS_COMMAND",
+        }
+    }
+
+    /// Accepted `zellij pipe --name <n>` names for this field.
+    fn matches_pipe(self, name: &str) -> bool {
+        match self {
+            Field::Title => matches!(name, "tab_title" | "title"),
+            Field::Description => matches!(name, "tab_desc" | "tab_description" | "description"),
+            Field::Status => matches!(name, "tab_status" | "status"),
+        }
+    }
+}
+
+/// Status color, resolved against the theme at render time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StatusColor {
+    Green,
+    Red,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    Orange,
+    Dim,
+    Normal,
+}
+
+impl StatusColor {
+    fn from_name(s: &str) -> Option<Self> {
+        Some(match s {
+            "green" => Self::Green,
+            "red" => Self::Red,
+            "yellow" => Self::Yellow,
+            "blue" => Self::Blue,
+            "magenta" => Self::Magenta,
+            "cyan" => Self::Cyan,
+            "orange" => Self::Orange,
+            "dim" | "gray" | "grey" => Self::Dim,
+            "normal" | "default" => Self::Normal,
+            _ => return None,
+        })
+    }
+
+    /// Auto-detect a color from a status keyword.
+    fn from_keyword(s: &str) -> Self {
+        let w = s
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match w.as_str() {
+            "running" | "busy" | "working" | "active" | "ok" | "success" => Self::Green,
+            "error" | "failed" | "fail" | "crashed" => Self::Red,
+            "waiting" | "warn" | "warning" | "pending" | "blocked" => Self::Yellow,
+            "idle" | "done" | "stopped" | "exited" => Self::Dim,
+            _ => Self::Normal,
+        }
+    }
+
+    fn sgr(self, colors: &Styling, normal_fg: &str) -> String {
+        match self {
+            Self::Green => fg(colors.exit_code_success.base),
+            Self::Red => fg(colors.exit_code_error.base),
+            Self::Yellow => fg(PaletteColor::EightBit(3)),
+            Self::Blue => fg(PaletteColor::EightBit(4)),
+            Self::Magenta => fg(PaletteColor::EightBit(5)),
+            Self::Cyan => fg(PaletteColor::EightBit(6)),
+            Self::Orange => fg(PaletteColor::EightBit(208)),
+            Self::Dim => format!("{}{}", DIM, normal_fg),
+            Self::Normal => normal_fg.to_string(),
+        }
+    }
+}
+
+/// Parse a status value: an optional `color:` prefix wins, otherwise the
+/// leading keyword picks the color (running -> green, error -> red, ...).
+fn parse_status(s: &str) -> (String, StatusColor) {
+    if let Some((c, rest)) = s.split_once(':') {
+        if let Some(color) = StatusColor::from_name(c.trim()) {
+            return (rest.trim().to_string(), color);
+        }
+    }
+    (s.to_string(), StatusColor::from_keyword(s))
+}
+
+// ---- State -------------------------------------------------------------------
 #[derive(Default)]
 struct State {
     tabs: Vec<TabInfo>,
     panes: PaneManifest,
     active_idx: usize, // 1-based
+    style: Style,
 
-    // Custom, user-updatable descriptions (set via `zellij pipe`).
-    tab_desc: HashMap<usize, String>, // key: 1-based tab index
-    pane_desc: HashMap<u32, String>,  // key: terminal pane id
+    // Per-field commands (config `*_command`, or env probe).
+    commands: HashMap<Field, String>,
+    interval: f64,
+    started: bool,       // engine kicked off
+    timer_running: bool, // refresh timer scheduled
 
-    // Live per-pane working directory (from CwdChanged events).
+    // Values set via `zellij pipe` (highest precedence), keyed by tab position.
+    pipe_vals: HashMap<(Field, usize), String>,
+    // Values produced by the per-field commands.
+    auto_vals: HashMap<(Field, usize), String>,
+
+    // Live per-pane working directory (cwd for the field commands).
     cwd: HashMap<u32, PathBuf>, // key: terminal pane id
 
-    // Click hit-testing: rendered row -> action.
-    row_action: Vec<Option<Action>>,
+    // Click hit-testing: rendered row -> 1-based tab index.
+    row_action: Vec<Option<u32>>,
 }
 
 register_plugin!(State);
 
 impl ZellijPlugin for State {
-    fn load(&mut self, _config: BTreeMap<String, String>) {
+    fn load(&mut self, config: BTreeMap<String, String>) {
+        for f in FIELDS {
+            if let Some(cmd) = config.get(f.config_key()) {
+                let cmd = cmd.trim();
+                if !cmd.is_empty() {
+                    self.commands.insert(f, cmd.to_string());
+                }
+            }
+        }
+        self.interval = config
+            .get("interval")
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(2.0)
+            .max(0.5);
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
+            PermissionType::RunCommands,
         ]);
         subscribe(&[
             EventType::TabUpdate,
             EventType::PaneUpdate,
+            EventType::ModeUpdate,
             EventType::Mouse,
             EventType::CwdChanged,
+            EventType::Timer,
+            EventType::RunCommandResult,
             EventType::PermissionRequestResult,
         ]);
     }
@@ -62,7 +252,14 @@ impl ZellijPlugin for State {
         match event {
             Event::PermissionRequestResult(_) => {
                 set_selectable(false);
+                self.start_engine();
                 should_render = true;
+            }
+            Event::ModeUpdate(mode_info) => {
+                if self.style != mode_info.style {
+                    self.style = mode_info.style;
+                    should_render = true;
+                }
             }
             Event::TabUpdate(tabs) => {
                 self.active_idx = tabs
@@ -71,25 +268,32 @@ impl ZellijPlugin for State {
                     .map(|i| i + 1)
                     .unwrap_or(1);
                 self.tabs = tabs;
+                // TabUpdate only fires once permissions are granted; kick the
+                // engine here too in case PermissionRequestResult never fired
+                // (pre-granted permissions).
+                self.start_engine();
                 should_render = true;
+            }
+            Event::Timer(_) => {
+                self.timer_running = false;
+                self.spawn_commands();
+                self.schedule_timer();
+            }
+            Event::RunCommandResult(exit_code, stdout, _stderr, ctx) => {
+                should_render = self.handle_command_result(exit_code, stdout, ctx);
             }
             Event::PaneUpdate(pm) => {
                 self.panes = pm;
                 should_render = true;
             }
-            Event::CwdChanged(pane_id, new_cwd, _) => {
-                if let PaneId::Terminal(id) = pane_id {
-                    self.cwd.insert(id, new_cwd);
-                    should_render = true;
-                }
+            Event::CwdChanged(PaneId::Terminal(id), new_cwd, _) => {
+                self.cwd.insert(id, new_cwd);
+                should_render = true;
             }
             Event::Mouse(Mouse::LeftClick(row, _col)) => {
                 let r = row as usize;
-                if let Some(Some(action)) = self.row_action.get(r) {
-                    match *action {
-                        Action::SwitchTab(idx) => switch_tab_to(idx),
-                        Action::FocusPane(id) => focus_terminal_pane(id, false, false),
-                    }
+                if let Some(Some(idx)) = self.row_action.get(r) {
+                    switch_tab_to(*idx);
                 }
             }
             Event::Mouse(Mouse::ScrollUp(_)) => {
@@ -106,151 +310,197 @@ impl ZellijPlugin for State {
         should_render
     }
 
-    /// Receive updatable descriptions from the CLI:
-    ///   zellij pipe --name tab_desc  --args "id=1"  -- "text"
-    ///   zellij pipe --name pane_desc --args "id=42" -- "text"
-    /// An empty payload clears the entry.
+    /// Set a field from the CLI (e.g. from an agent running in a pane):
+    ///
+    ///   zellij pipe --name tab_title  --args "pane_id=$ZELLIJ_PANE_ID" -- "my build"
+    ///   zellij pipe --name tab_desc   --args "pane_id=$ZELLIJ_PANE_ID" -- "compiling the release"
+    ///   zellij pipe --name tab_status --args "pane_id=$ZELLIJ_PANE_ID" -- "running"
+    ///   zellij pipe --name tab_status --args "tab=2" -- "red:tests failed"
+    ///   zellij pipe --name tab_desc -- "reviewing PR"   # no target -> active tab
+    ///
+    /// An empty payload clears the override (falling back to command/default).
     fn pipe(&mut self, msg: PipeMessage) -> bool {
-        let id_arg = msg.args.get("id").cloned();
+        let Some(field) = FIELDS.iter().copied().find(|f| f.matches_pipe(&msg.name)) else {
+            return false;
+        };
         let text = msg.payload.unwrap_or_default();
-        match msg.name.as_str() {
-            "tab_desc" => {
-                if let Some(id) = id_arg.and_then(|s| s.parse::<usize>().ok()) {
-                    if text.trim().is_empty() {
-                        self.tab_desc.remove(&id);
-                    } else {
-                        self.tab_desc.insert(id, text);
-                    }
-                    return true;
-                }
+
+        // Resolve the target tab position (0-based).
+        let pos: Option<usize> =
+            if let Some(pid) = msg.args.get("pane_id").and_then(|s| s.parse::<u32>().ok()) {
+                self.tab_position_of_pane(pid)
+            } else if let Some(t) = msg.args.get("tab").and_then(|s| s.parse::<usize>().ok()) {
+                (t >= 1).then(|| t - 1)
+            } else {
+                self.active_idx.checked_sub(1)
+            };
+
+        if let Some(pos) = pos {
+            if text.trim().is_empty() {
+                self.pipe_vals.remove(&(field, pos));
+            } else {
+                self.pipe_vals.insert((field, pos), text.trim().to_string());
             }
-            "pane_desc" => {
-                if let Some(id) = id_arg.and_then(|s| s.parse::<u32>().ok()) {
-                    if text.trim().is_empty() {
-                        self.pane_desc.remove(&id);
-                    } else {
-                        self.pane_desc.insert(id, text);
-                    }
-                    return true;
-                }
-            }
-            _ => {}
+            return true;
         }
         false
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
-        // Do not gate on a permission event: when permissions are pre-granted
-        // via permissions.kdl, PermissionRequestResult may not fire, and gating
-        // on it would render nothing. Without permission, TabUpdate never fires
-        // and tabs stays empty anyway.
-        if self.tabs.is_empty() || cols == 0 {
+        self.row_action.clear();
+        if self.tabs.is_empty() || rows == 0 || cols == 0 {
             return;
         }
 
-        let plan = self.build_plan();
+        let (lines, actions) = self.build_lines(cols);
 
-        let mut lines: Vec<String> = Vec::with_capacity(plan.len());
-        self.row_action = Vec::with_capacity(plan.len());
-        for row in plan {
-            self.row_action.push(row.action);
-            lines.push(row.render(cols));
+        // Keep the active tab block visible when tabs overflow the pane.
+        let offset = scroll_offset(&actions, self.active_idx as u32, lines.len(), rows);
+
+        let visible: Vec<&String> = lines.iter().skip(offset).take(rows).collect();
+        self.row_action = actions.into_iter().skip(offset).take(rows).collect();
+
+        let mut out = String::new();
+        for (i, l) in visible.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(l);
         }
-        lines.truncate(rows);
-        self.row_action.truncate(rows);
-
-        print!("{}", lines.join("\n"));
+        print!("{}", out);
     }
 }
 
-/// A single rendered row and the click action it maps to.
-struct Row {
-    text: String, // already-styled content (without padding/reset handling of bg)
-    gray: bool,   // description line (rendered dim)
-    active: bool, // belongs to the active tab / focused pane (bg highlight)
-    bold: bool,   // emphasize (tab title / focused pane title)
-    action: Option<Action>,
-}
-
-impl Row {
-    fn render(&self, cols: usize) -> String {
-        let text = truncate(&self.text, cols);
-        let padded = pad_to(&text, cols);
-        // Only the selected tab block gets a background; everything else keeps
-        // the terminal default (black). Text colors stay constant.
-        let bg = if self.active { ACTIVE_BG } else { "" };
-        let fg = if self.gray { DIM } else { FG_NORMAL };
-        let b = if self.bold { BOLD } else { "" };
-        format!("{}{}{}{}{}", bg, fg, b, padded, RESET)
-    }
-}
-
+// ---- Engine (commands producing field values) ---------------------------------
 impl State {
-    /// Build the full list of rows (tabs, their descriptions, nested panes).
-    fn build_plan(&self) -> Vec<Row> {
-        let mut plan: Vec<Row> = Vec::new();
+    /// Kick off the engine exactly once: probe the zellij server's environment
+    /// for ZELLIJ_SIDEBAR_*_COMMAND vars (config takes precedence per field),
+    /// and start the refresh timer if any command is already configured.
+    fn start_engine(&mut self) {
+        if self.started {
+            return;
+        }
+        self.started = true;
 
-        for (i, tab) in self.tabs.iter().enumerate() {
-            let idx = i + 1;
-            let tab_active = tab.active;
+        let mut ctx = BTreeMap::new();
+        ctx.insert("kind".to_string(), "probe".to_string());
+        let probe = format!(
+            "printf '%s{sep}%s{sep}%s' \"${t}\" \"${d}\" \"${s}\"",
+            sep = FIELD_SEP,
+            t = Field::Title.env_var(),
+            d = Field::Description.env_var(),
+            s = Field::Status.env_var(),
+        );
+        run_command(&["sh", "-c", &probe], ctx);
 
-            // Tab title line: "● name" / "o name"
-            let marker = if tab_active { TAB_ACTIVE } else { TAB_INACTIVE };
-            plan.push(Row {
-                text: format!("{} {}", marker, self.tab_name(tab)),
-                gray: false,
-                active: tab_active,
-                bold: true,
-                action: Some(Action::SwitchTab(idx as u32)),
-            });
+        self.schedule_timer();
+    }
 
-            // Tab description line (custom, else derived). Always shown.
-            // Whole active-tab block shares the same background (active = tab_active).
-            plan.push(Row {
-                text: format!("  {}", self.tab_description(tab, idx)),
-                gray: true,
-                active: tab_active,
-                bold: false,
-                action: Some(Action::SwitchTab(idx as u32)),
-            });
+    fn schedule_timer(&mut self) {
+        if !self.timer_running && !self.commands.is_empty() {
+            self.timer_running = true;
+            set_timeout(self.interval);
+        }
+    }
 
-            // Panes nested under the tab.
-            if let Some(panes) = self.panes.panes.get(&tab.position) {
-                for p in panes.iter().filter(|p| !p.is_plugin) {
-                    let focused = tab_active && p.is_focused;
-                    // Focus within the active tab is shown by the marker + bold,
-                    // not a different background.
-                    let pmark = if focused {
-                        PANE_FOCUSED
-                    } else {
-                        PANE_UNFOCUSED
-                    };
-                    plan.push(Row {
-                        text: format!("  {} {}", pmark, self.pane_name(p)),
-                        gray: false,
-                        active: tab_active,
-                        bold: focused,
-                        action: Some(Action::FocusPane(p.id)),
-                    });
+    /// Run each configured field command once per tab, in the focused pane's
+    /// cwd, with tab metadata exposed as environment variables.
+    fn spawn_commands(&self) {
+        if self.commands.is_empty() {
+            return;
+        }
+        for tab in &self.tabs {
+            let focused = self.focused_pane(tab.position);
+            let cwd = focused
+                .and_then(|p| self.cwd.get(&p.id).cloned())
+                .unwrap_or_else(|| PathBuf::from("."));
 
-                    if let Some(desc) = self.pane_description(p) {
-                        plan.push(Row {
-                            text: format!("      {}", desc),
-                            gray: true,
-                            active: tab_active,
-                            bold: false,
-                            action: Some(Action::FocusPane(p.id)),
-                        });
-                    }
-                }
+            let mut env = BTreeMap::new();
+            env.insert(
+                "ZELLIJ_TAB_POSITION".to_string(),
+                (tab.position + 1).to_string(),
+            );
+            env.insert("ZELLIJ_TAB_NAME".to_string(), tab.name.clone());
+            if let Some(p) = focused {
+                env.insert("ZELLIJ_FOCUSED_PANE_ID".to_string(), p.id.to_string());
+            }
+
+            for (field, cmd) in &self.commands {
+                let mut ctx = BTreeMap::new();
+                ctx.insert("kind".to_string(), field.key().to_string());
+                ctx.insert("tab".to_string(), tab.position.to_string());
+                run_command_with_env_variables_and_cwd(
+                    &["sh", "-c", cmd],
+                    env.clone(),
+                    cwd.clone(),
+                    ctx,
+                );
             }
         }
-        plan
     }
 
-    /// Tab name: use zellij's own tab name so it matches the built-in tab bar
-    /// (unnamed tabs are "Tab #N"). Never falls back to "...".
-    fn tab_name(&self, tab: &TabInfo) -> String {
+    /// Handle probe / per-tab field command results.
+    fn handle_command_result(
+        &mut self,
+        exit_code: Option<i32>,
+        stdout: Vec<u8>,
+        ctx: BTreeMap<String, String>,
+    ) -> bool {
+        let out = String::from_utf8_lossy(&stdout);
+        match ctx.get("kind").map(|s| s.as_str()) {
+            Some("probe") => {
+                let parts: Vec<&str> = out.splitn(3, FIELD_SEP).collect();
+                for (i, f) in FIELDS.iter().enumerate() {
+                    let cmd = parts.get(i).map(|s| s.trim()).unwrap_or("");
+                    // Config takes precedence over the env var.
+                    if !cmd.is_empty() && !self.commands.contains_key(f) {
+                        self.commands.insert(*f, cmd.to_string());
+                    }
+                }
+                self.schedule_timer();
+                false
+            }
+            Some(kind) => {
+                let Some(field) = FIELDS.iter().copied().find(|f| f.key() == kind) else {
+                    return false;
+                };
+                let Some(pos) = ctx.get("tab").and_then(|s| s.parse::<usize>().ok()) else {
+                    return false;
+                };
+                // Description keeps its full output (it may wrap to two lines);
+                // title/status only use the first line.
+                let value = if field == Field::Description {
+                    out.trim().replace('\n', " ")
+                } else {
+                    out.lines().next().unwrap_or("").trim().to_string()
+                };
+                let key = (field, pos);
+                if exit_code == Some(0) && !value.is_empty() {
+                    let changed = self.auto_vals.get(&key) != Some(&value);
+                    self.auto_vals.insert(key, value);
+                    changed
+                } else {
+                    self.auto_vals.remove(&key).is_some()
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+// ---- Field values --------------------------------------------------------------
+impl State {
+    fn field_val(&self, field: Field, pos: usize) -> Option<&String> {
+        self.pipe_vals
+            .get(&(field, pos))
+            .or_else(|| self.auto_vals.get(&(field, pos)))
+    }
+
+    /// Title: pipe -> command -> zellij tab name.
+    fn tab_title(&self, tab: &TabInfo) -> String {
+        if let Some(t) = self.field_val(Field::Title, tab.position) {
+            return t.clone();
+        }
         if tab.name.is_empty() {
             format!("Tab #{}", tab.position + 1)
         } else {
@@ -258,27 +508,43 @@ impl State {
         }
     }
 
-    /// Tab description: custom (via pipe) else derived pane count + flags.
-    /// Tab description: custom (via pipe) -> focused pane cwd -> focused command.
-    fn tab_description(&self, tab: &TabInfo, idx: usize) -> String {
-        if let Some(d) = self.tab_desc.get(&idx) {
-            return d.clone();
-        }
-        if let Some(p) = self.focused_pane(tab.position) {
-            if let Some(cwd) = self.cwd.get(&p.id) {
-                return shorten_path(cwd);
-            }
-            if let Some(cmd) = &p.terminal_command {
-                return command_of(cmd);
-            }
-            if let Some(n) = meaningful_name(&p.title) {
-                return n;
-            }
-        }
-        String::new()
+    /// Description: pipe -> command -> empty (hidden).
+    fn tab_description(&self, tab: &TabInfo) -> String {
+        self.field_val(Field::Description, tab.position)
+            .cloned()
+            .unwrap_or_default()
     }
 
-    fn focused_pane<'a>(&'a self, pos: usize) -> Option<&'a PaneInfo> {
+    /// Status: pipe -> command -> derived running|idle|error.
+    fn tab_status(&self, tab: &TabInfo) -> (String, StatusColor) {
+        if let Some(s) = self.field_val(Field::Status, tab.position) {
+            return parse_status(s);
+        }
+        self.default_status(tab)
+    }
+
+    /// Derived status: a command pane still running -> "running"; a command
+    /// pane that exited non-zero -> "error"; otherwise "idle".
+    fn default_status(&self, tab: &TabInfo) -> (String, StatusColor) {
+        if let Some(panes) = self.panes.panes.get(&tab.position) {
+            let cmds: Vec<&PaneInfo> = panes
+                .iter()
+                .filter(|p| !p.is_plugin && p.terminal_command.is_some())
+                .collect();
+            if cmds.iter().any(|p| !p.exited) {
+                return ("running".to_string(), StatusColor::Green);
+            }
+            if cmds
+                .iter()
+                .any(|p| p.exited && p.exit_status.unwrap_or(0) != 0)
+            {
+                return ("error".to_string(), StatusColor::Red);
+            }
+        }
+        ("idle".to_string(), StatusColor::Dim)
+    }
+
+    fn focused_pane(&self, pos: usize) -> Option<&PaneInfo> {
         self.panes
             .panes
             .get(&pos)?
@@ -286,58 +552,184 @@ impl State {
             .find(|p| p.is_focused && !p.is_plugin)
     }
 
-    /// Pane name: meaningful title -> command -> "pane {id}". Never "...".
-    fn pane_name(&self, p: &PaneInfo) -> String {
-        if let Some(n) = meaningful_name(&p.title) {
-            return n;
-        }
-        if let Some(cmd) = &p.terminal_command {
-            return command_of(cmd);
-        }
-        format!("pane {}", p.id)
-    }
-
-    /// Pane description: custom (via pipe) -> cwd -> terminal command.
-    fn pane_description(&self, p: &PaneInfo) -> Option<String> {
-        if let Some(d) = self.pane_desc.get(&p.id) {
-            return Some(d.clone());
-        }
-        if let Some(cwd) = self.cwd.get(&p.id) {
-            return Some(shorten_path(cwd));
-        }
-        p.terminal_command.clone()
+    /// Which tab (position) contains the given terminal pane?
+    fn tab_position_of_pane(&self, pane_id: u32) -> Option<usize> {
+        self.panes.panes.iter().find_map(|(pos, panes)| {
+            panes
+                .iter()
+                .any(|p| !p.is_plugin && p.id == pane_id)
+                .then_some(*pos)
+        })
     }
 }
 
-/// Return the title if it is a real title (not a zellij placeholder).
-fn meaningful_name(title: &str) -> Option<String> {
-    let t = title.trim();
-    if t.is_empty() || t.starts_with("Pane #") || t.starts_with("Tab #") {
-        None
+// ---- Rendering ------------------------------------------------------------------
+impl State {
+    /// Build every line of the sidebar plus its click target.
+    ///
+    /// Per tab:
+    ///   ▎1 title            (bold; accent bar + themed bg when active)
+    ///   ▎  ● status         (colored)
+    ///   ▎  description...   (dim, word-wrapped, max 2 lines, hidden if empty)
+    fn build_lines(&self, cols: usize) -> (Vec<String>, Vec<Option<u32>>) {
+        let colors = self.style.colors;
+        let normal = colors.text_unselected;
+        let selected = colors.list_selected;
+        let accent = colors.frame_selected.base;
+
+        let mut lines = Vec::new();
+        let mut actions = Vec::new();
+
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let idx = (i + 1) as u32;
+            let active = tab.active;
+
+            let (block_bg, base_fg) = if active {
+                (bg(darken(selected.background, 0.6)), fg(selected.base))
+            } else {
+                (String::new(), fg(normal.base))
+            };
+            let bar = if active {
+                format!("{}▎{}", fg(accent), RESET)
+            } else {
+                " ".to_string()
+            };
+            let push = |text: String, lines: &mut Vec<String>, actions: &mut Vec<Option<u32>>| {
+                lines.push(text);
+                actions.push(Some(idx));
+            };
+
+            // Title line: `▎1 title` (the index number is dimmed).
+            let num = idx.to_string();
+            let title = truncate(
+                &format!("{} {}", num, self.tab_title(tab)),
+                cols.saturating_sub(2),
+            );
+            let padded = pad_to(&title, cols.saturating_sub(2));
+            // Split off the leading index digits (ASCII, byte len == char len).
+            let (head, tail) = padded.split_at(num.len().min(padded.len()));
+            push(
+                format!(
+                    "{bg}{bar}{bg} {dim}{fgc}{head}{reset}{bg}{bold}{fgc}{tail}{reset}",
+                    bg = block_bg,
+                    bar = bar,
+                    dim = DIM,
+                    bold = BOLD,
+                    fgc = base_fg,
+                    head = head,
+                    tail = tail,
+                    reset = RESET,
+                ),
+                &mut lines,
+                &mut actions,
+            );
+
+            // Status line: `▎  ● status`
+            let (status, color) = self.tab_status(tab);
+            let status = truncate(&status, cols.saturating_sub(6));
+            let sgr = color.sgr(&colors, &base_fg);
+            push(
+                format!(
+                    "{bg}{bar}{bg}   {sgr}● {text}{reset}",
+                    bg = block_bg,
+                    bar = bar,
+                    sgr = sgr,
+                    text = pad_to(&status, cols.saturating_sub(6)),
+                    reset = RESET,
+                ),
+                &mut lines,
+                &mut actions,
+            );
+
+            // Description: dim, word-wrapped, up to 2 lines, hidden when empty.
+            let desc = self.tab_description(tab);
+            for l in wrap(&desc, cols.saturating_sub(4), 2) {
+                push(
+                    format!(
+                        "{bg}{bar}{bg}   {dim}{fgc}{text}{reset}",
+                        bg = block_bg,
+                        bar = bar,
+                        dim = DIM,
+                        fgc = base_fg,
+                        text = pad_to(&l, cols.saturating_sub(4)),
+                        reset = RESET,
+                    ),
+                    &mut lines,
+                    &mut actions,
+                );
+            }
+        }
+
+        (lines, actions)
+    }
+}
+
+/// Scroll offset so that the active tab's block stays fully visible.
+fn scroll_offset(actions: &[Option<u32>], active: u32, total: usize, rows: usize) -> usize {
+    if total <= rows {
+        return 0;
+    }
+    let Some(first) = actions.iter().position(|a| *a == Some(active)) else {
+        return 0;
+    };
+    let last = actions
+        .iter()
+        .rposition(|a| *a == Some(active))
+        .unwrap_or(first);
+    if last >= rows {
+        (last + 1).saturating_sub(rows).min(first)
     } else {
-        Some(t.to_string())
+        0
     }
 }
 
-/// Compact a path to its last two components (e.g. "Projects/foo").
-fn shorten_path(p: &Path) -> String {
-    let comps: Vec<&str> = p
-        .components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .filter(|s| *s != "/")
-        .collect();
-    match comps.len() {
-        0 => "/".to_string(),
-        1 => comps[0].to_string(),
-        n => format!("{}/{}", comps[n - 2], comps[n - 1]),
+/// Greedy word-wrap to `width`, at most `max_lines` lines; the last line is
+/// truncated with an ellipsis if the text doesn't fit. Empty text -> no lines.
+fn wrap(s: &str, width: usize, max_lines: usize) -> Vec<String> {
+    // Normalize whitespace so the "content dropped?" check below is exact.
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if s.is_empty() || width == 0 || max_lines == 0 {
+        return Vec::new();
     }
-}
-
-/// Extract a command name from a command line: first token -> path basename.
-fn command_of(cmd: &str) -> String {
-    let first = cmd.split_whitespace().next().unwrap_or(cmd);
-    let base = first.rsplit('/').next().unwrap_or(first);
-    base.to_string()
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        let sep = if cur.is_empty() { 0 } else { 1 };
+        if cur.width() + sep + word.width() <= width {
+            if sep == 1 {
+                cur.push(' ');
+            }
+            cur.push_str(word);
+        } else {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            if lines.len() == max_lines {
+                break;
+            }
+            // A single word longer than the width gets hard-truncated.
+            cur = if word.width() > width {
+                truncate(word, width)
+            } else {
+                word.to_string()
+            };
+        }
+    }
+    if !cur.is_empty() && lines.len() < max_lines {
+        lines.push(cur);
+    }
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+    }
+    // If we dropped content, mark the last visible line.
+    let shown: usize = lines.iter().map(|l| l.width()).sum();
+    let sep_count = lines.len().saturating_sub(1);
+    if shown + sep_count < s.width() {
+        if let Some(last) = lines.last_mut() {
+            *last = truncate(&format!("{}…", last), width);
+        }
+    }
+    lines
 }
 
 fn truncate(s: &str, max: usize) -> String {
