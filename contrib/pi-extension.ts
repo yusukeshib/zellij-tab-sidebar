@@ -13,7 +13,7 @@
  * No-op when pi is not running inside a zellij pane.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 
 const PANE_ID = process.env.ZELLIJ_PANE_ID;
 const IN_ZELLIJ = Boolean(process.env.ZELLIJ && PANE_ID);
@@ -32,11 +32,15 @@ function pipe(name: string, payload: string): void {
 // Async + fire-and-forget: never blocks the agent, and any failure/timeout just
 // leaves the raw-prompt fallback in place. `--no-extensions` avoids re-loading
 // this extension (no recursion).
+//
+// NOTE: must use spawn + stdin.end(), NOT execFile. `pi -p` reads stdin, so an
+// open stdin pipe (execFile's default) makes it hang until timeout. Closing
+// stdin sends EOF so it returns in ~2s.
 function summarize(prompt: string, cb: (summary: string) => void): void {
   const instruction =
     "Summarize this coding task in 3 to 5 words. Output only the summary, " +
     "lowercase, no punctuation, no quotes. Task: ";
-  execFile(
+  const child = spawn(
     "pi",
     [
       "-p",
@@ -46,13 +50,18 @@ function summarize(prompt: string, cb: (summary: string) => void): void {
       "--no-session",
       instruction + prompt,
     ],
-    { timeout: 30_000, maxBuffer: 1 << 20 },
-    (err, stdout) => {
-      if (err) return; // keep the fallback
-      const s = (stdout ?? "").replace(/\s+/g, " ").trim().slice(0, 60);
-      if (s) cb(s);
-    },
+    { timeout: 30_000 },
   );
+  let out = "";
+  child.stdout?.on("data", (d) => {
+    if (out.length < 4096) out += d;
+  });
+  child.on("error", () => {}); // e.g. pi not on PATH -> keep the fallback
+  child.on("close", () => {
+    const s = out.replace(/\s+/g, " ").trim().slice(0, 60);
+    if (s) cb(s);
+  });
+  child.stdin?.end(); // send EOF so `pi -p` doesn't wait on stdin
 }
 
 export default function (pi: ExtensionAPI) {
