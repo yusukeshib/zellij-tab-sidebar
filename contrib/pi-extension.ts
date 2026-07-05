@@ -39,9 +39,11 @@ function pipe(name: string, payload: string): void {
 // stdin sends EOF so it returns in ~2s.
 function summarize(text: string, cb: (summary: string) => void): void {
   const instruction =
-    "Summarize what this coding session is currently working on in 3 to 5 " +
-    "words. Output only the summary, lowercase, no punctuation, no quotes. " +
-    "Base it on the user's requests below (later ones are more recent):\n\n";
+    "Summarize what this coding session is currently working on, in Japanese, " +
+    "in about 10 to 20 characters. Output only the summary, no punctuation, " +
+    "no quotes, no explanations. If you cannot tell what is being worked on, " +
+    "output exactly: 不明. Base it on the user's requests below (later ones " +
+    "are more recent):\n\n";
   const child = spawn(
     "pi",
     [
@@ -70,7 +72,13 @@ function summarize(text: string, cb: (summary: string) => void): void {
     if (out.length < 4096) out += d;
   });
   child.on("error", () => finish("")); // e.g. pi not on PATH
-  child.on("close", () => finish(out.replace(/\s+/g, " ").trim().slice(0, 60)));
+  child.on("close", () => {
+    const s = out.replace(/\s+/g, " ").trim();
+    // Guard: a valid summary is short. Refusals / explanations ("申し訳ありま
+    // せんが…") are long or match the explicit 不明 sentinel — drop them so the
+    // sidebar keeps the previous description instead of showing garbage.
+    finish(s.length > 0 && s.length <= 30 && s !== "不明" ? s : "");
+  });
   child.stdin?.end(); // send EOF so `pi -p` doesn't wait on stdin
 }
 

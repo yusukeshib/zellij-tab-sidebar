@@ -193,15 +193,20 @@ fn parse_status(s: &str) -> (String, StatusColor) {
 // reaches the instances alive at pipe time, so instances created later (e.g.
 // when you open a new tab) never saw past overrides and render those tabs blank.
 //
-// Fix: persist overrides to `/data` — a plugin-owned folder shared by all
-// loaded instances of this plugin — and reload it on load and on the timer.
+// Fix: persist overrides to `/cache` — the only plugin folder zellij shares
+// across instances (`/data` maps to a per-instance dir keyed by
+// `<plugin_id>-<client_id>`, so it is NOT shared) — and reload it on the timer.
+// `/cache` persists across sessions and is shared between concurrent sessions,
+// so the file is scoped by session name (pane ids restart per session).
 // Keyed by pane id: stable across tab reorder/close, and identical across
 // instances (they all receive the same PaneManifest).
-const STATE_PATH: &str = "/data/pipe-state.tsv";
+fn state_path(session: &str) -> String {
+    format!("/cache/pipe-state-{}.tsv", session)
+}
 
-fn read_pipe_state() -> HashMap<(Field, u32), String> {
+fn read_pipe_state(session: &str) -> HashMap<(Field, u32), String> {
     let mut map = HashMap::new();
-    let Ok(content) = std::fs::read_to_string(STATE_PATH) else {
+    let Ok(content) = std::fs::read_to_string(state_path(session)) else {
         return map;
     };
     for line in content.lines() {
@@ -221,7 +226,7 @@ fn read_pipe_state() -> HashMap<(Field, u32), String> {
     map
 }
 
-fn write_pipe_state(map: &HashMap<(Field, u32), String>) {
+fn write_pipe_state(session: &str, map: &HashMap<(Field, u32), String>) {
     let mut s = String::new();
     for ((field, pid), val) in map {
         // Values are single-line records; strip separators defensively.
@@ -233,25 +238,31 @@ fn write_pipe_state(map: &HashMap<(Field, u32), String>) {
         s.push_str(&val);
         s.push('\n');
     }
-    let _ = std::fs::write(STATE_PATH, s);
+    let _ = std::fs::write(state_path(session), s);
 }
 
 // ---- State -------------------------------------------------------------------
+
+/// Timer cadence: pipe-state sync every tick, commands every `interval`.
+const TICK_SECS: f64 = 2.0;
 #[derive(Default)]
 struct State {
     tabs: Vec<TabInfo>,
     panes: PaneManifest,
     active_idx: usize, // 1-based
     style: Style,
+    // Session name (from ModeUpdate) — scopes the shared override file.
+    session: Option<String>,
 
     // Per-field commands (config `*_command`, or env probe).
     commands: HashMap<Field, String>,
     interval: f64,
     started: bool,       // engine kicked off
     timer_running: bool, // refresh timer scheduled
+    ticks_left: u32,     // timer ticks until the next command run
 
     // Overrides set via `zellij pipe` (highest precedence), keyed by pane id and
-    // persisted to `/data` so all sidebar instances (one per tab) stay in sync.
+    // persisted to `/cache` so all sidebar instances (one per tab) stay in sync.
     pipe_vals: HashMap<(Field, u32), String>,
     // Values produced by the per-field commands, keyed by tab position.
     auto_vals: HashMap<(Field, usize), String>,
@@ -280,12 +291,13 @@ impl ZellijPlugin for State {
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(2.0)
             .max(0.5);
-        // Load overrides already published by sibling instances.
-        self.pipe_vals = read_pipe_state();
+        // Overrides published by sibling instances are loaded once ModeUpdate
+        // delivers the session name (the shared file is session-scoped).
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
             PermissionType::RunCommands,
+            PermissionType::ReadPaneContents,
         ]);
         subscribe(&[
             EventType::TabUpdate,
@@ -312,6 +324,11 @@ impl ZellijPlugin for State {
                     self.style = mode_info.style;
                     should_render = true;
                 }
+                if self.session != mode_info.session_name {
+                    self.session = mode_info.session_name.clone();
+                    // First chance to load overrides published by siblings.
+                    should_render = self.reload_pipe_state() || should_render;
+                }
             }
             Event::TabUpdate(tabs) => {
                 self.active_idx = tabs
@@ -330,7 +347,13 @@ impl ZellijPlugin for State {
                 self.timer_running = false;
                 // Pick up overrides written by other tabs' sidebar instances.
                 should_render = self.reload_pipe_state();
-                self.spawn_commands();
+                // The timer ticks fast (cross-instance sync must be snappy);
+                // the field commands only run every `interval` seconds.
+                self.ticks_left = self.ticks_left.saturating_sub(1);
+                if self.ticks_left == 0 {
+                    self.spawn_commands();
+                    self.ticks_left = (self.interval / TICK_SECS).ceil().max(1.0) as u32;
+                }
                 self.schedule_timer();
             }
             Event::RunCommandResult(exit_code, stdout, _stderr, ctx) => {
@@ -400,13 +423,14 @@ impl ZellijPlugin for State {
 
         // Read-modify-write the shared file so concurrent writes from sibling
         // instances don't clobber each other.
-        let mut vals = read_pipe_state();
+        let session = self.session.clone().unwrap_or_default();
+        let mut vals = read_pipe_state(&session);
         if text.trim().is_empty() {
             vals.remove(&(field, pid));
         } else {
             vals.insert((field, pid), text.trim().to_string());
         }
-        write_pipe_state(&vals);
+        write_pipe_state(&session, &vals);
         self.pipe_vals = vals;
         true
     }
@@ -466,7 +490,7 @@ impl State {
     fn schedule_timer(&mut self) {
         if !self.timer_running {
             self.timer_running = true;
-            set_timeout(self.interval);
+            set_timeout(self.interval.min(TICK_SECS));
         }
     }
 
@@ -490,6 +514,14 @@ impl State {
             env.insert("ZELLIJ_TAB_NAME".to_string(), tab.name.clone());
             if let Some(p) = focused {
                 env.insert("ZELLIJ_FOCUSED_PANE_ID".to_string(), p.id.to_string());
+                // Expose the focused pane's visible buffer so commands can
+                // summarize what's actually happening in the tab.
+                if let Ok(contents) = get_pane_scrollback(PaneId::Terminal(p.id), false) {
+                    let text = pane_tail(&contents.viewport);
+                    if !text.is_empty() {
+                        env.insert("ZELLIJ_SIDEBAR_PANE_CONTENT".to_string(), text);
+                    }
+                }
             }
 
             for (field, cmd) in &self.commands {
@@ -580,7 +612,7 @@ impl State {
 
     /// Reload the shared override file; returns whether anything changed.
     fn reload_pipe_state(&mut self) -> bool {
-        let vals = read_pipe_state();
+        let vals = read_pipe_state(self.session.as_deref().unwrap_or_default());
         if vals != self.pipe_vals {
             self.pipe_vals = vals;
             true
@@ -798,15 +830,18 @@ fn wrap(s: &str, width: usize, max_lines: usize) -> Vec<String> {
             if !cur.is_empty() {
                 lines.push(std::mem::take(&mut cur));
             }
+            // A word longer than the width is broken across lines (CJK text
+            // has no spaces, so a whole description is one "word").
+            let mut word = word;
+            while lines.len() < max_lines && word.width() > width {
+                let (head, rest) = split_at_width(word, width);
+                lines.push(head.to_string());
+                word = rest;
+            }
             if lines.len() == max_lines {
                 break;
             }
-            // A single word longer than the width gets hard-truncated.
-            cur = if word.width() > width {
-                truncate(word, width)
-            } else {
-                word.to_string()
-            };
+            cur = word.to_string();
         }
     }
     if !cur.is_empty() && lines.len() < max_lines {
@@ -824,6 +859,42 @@ fn wrap(s: &str, width: usize, max_lines: usize) -> Vec<String> {
         }
     }
     lines
+}
+
+/// Tail of a pane viewport, suitable for an env var: trailing blank lines
+/// dropped, last 40 lines, capped to 4KB (cut at a char boundary).
+fn pane_tail(viewport: &[String]) -> String {
+    let lines: Vec<&str> = viewport.iter().map(|l| l.trim_end()).collect();
+    let end = lines
+        .iter()
+        .rposition(|l| !l.is_empty())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let start = end.saturating_sub(40);
+    let text = lines[start..end].join("\n");
+    // Byte cap: keep the tail, not the head.
+    const MAX: usize = 4096;
+    if text.len() <= MAX {
+        return text;
+    }
+    let mut cut = text.len() - MAX;
+    while !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    text[cut..].to_string()
+}
+
+/// Split at the last char boundary whose prefix display width fits in `max`.
+fn split_at_width(s: &str, max: usize) -> (&str, &str) {
+    let mut w = 0usize;
+    for (i, ch) in s.char_indices() {
+        let cw = ch.to_string().width();
+        if w + cw > max {
+            return s.split_at(i);
+        }
+        w += cw;
+    }
+    (s, "")
 }
 
 fn truncate(s: &str, max: usize) -> String {

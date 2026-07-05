@@ -161,6 +161,10 @@ Commands run with:
 - `$ZELLIJ_TAB_POSITION` — 1-based tab index
 - `$ZELLIJ_TAB_NAME` — the tab's name
 - `$ZELLIJ_FOCUSED_PANE_ID` — the focused pane's id
+- `$ZELLIJ_SIDEBAR_PANE_CONTENT` — the focused pane's visible buffer (last
+  40 non-blank lines, capped at 4KB). Summarize it however you like — see
+  [`contrib/summarize-pane.sh`](contrib/summarize-pane.sh) for an LLM example
+  (cached per tab, only re-summarizes when the buffer changes).
 
 An agent then only needs to write one-liners to files (e.g. `.agent-status`) in
 its repo — no zellij integration required at all.
